@@ -1,0 +1,19 @@
+global:
+  scrape_interval:     2s # Set the scrape interval to every 15 seconds. Default is every 1 minute.
+  evaluation_interval: 2s # Evaluate rules every 15 seconds. The default is every 1 minute.
+  # scrape_timeout is set to the global default (10s).
+
+scrape_configs:
+  - job_name: 'prometheus_broadcaster'
+    scrape_interval: 1s
+    metrics_path: '/metrics'
+    scheme: https
+    static_configs:
+      - targets: ['webrtc.hopto.org:8080']
+# scrape_configs:
+  - job_name: 'prometheus_broadcast_receiver'
+    scrape_interval: 1s
+    metrics_path: '/metrics'
+    scheme: https
+    static_configs:
+      - targets: ['webrtc2.hopto.org:8082']
