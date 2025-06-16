@@ -177,6 +177,7 @@ func init() {
 func main() {
 	port_s1 := flag.Int("port_s1", 8080, "http server port")
 	port_s2 := flag.Int("port_s2", 8081, "http server port")
+	testing := flag.Bool("testing", false, "testing mode")
 	flag.Parse()
 
 	ch := make(chan string)
@@ -229,6 +230,7 @@ func main() {
 	}
 	interceptorRegistry.Add(intervalPliFactory)
 	messageChannel := make(chan []byte)
+	control_signal_channel := make(chan []byte)
 
 	statsInterceptorFactory, err := stats.NewInterceptor()
 	if err != nil {
@@ -387,7 +389,13 @@ func main() {
 
 		go func() {
 			for {
-				dataChannel.Send(<-messageChannel)
+				if testing != nil && *testing {
+					dataChannel.Send(<-messageChannel)
+
+				} else {
+					// If not in testing mode, just forward the message as is
+					dataChannel.Send(<-control_signal_channel)
+				}
 			}
 		}()
 	})
@@ -460,51 +468,56 @@ func main() {
 			lastMessageTime.Store(time.Now())
 			updated_jitter.Store(0.0)
 			dataChannel.OnMessage(func(msg webrtc.DataChannelMessage) {
-				var frameData DataChannelMessage
-				err := json.Unmarshal(msg.Data, &frameData)
-				if err != nil {
-					fmt.Println("Error unmarshalling:", err)
-					return
+				if testing != nil && *testing {
+					var frameData DataChannelMessage
+					err := json.Unmarshal(msg.Data, &frameData)
+					if err != nil {
+						fmt.Println("Error unmarshalling:", err)
+						return
+					}
+					sfuTimestamp_now := time.Now()
+					sfuTimestamp := sfuTimestamp_now.UnixMilli()
+					sfuTimestamp_prev := lastMessageTime.Load().(time.Time)
+					delta := sfuTimestamp_now.Sub(sfuTimestamp_prev).Milliseconds()
+					jitter := updated_jitter.Load().(float64)
+					deltaAbs := math.Abs(float64(delta) - float64(frameData.MessageSendRate))
+					jitter = jitter + ((1.0 / 16.0) * (deltaAbs - jitter))
+					updated_jitter.Store(jitter)
+					webrtcStats.InterArrivalTime.WithLabelValues("InterArrivalTime").Set(float64(delta))
+					webrtcStats.PreviousMessageArrivalTime.WithLabelValues("PreviousMessageArrivalTime").Set(float64(sfuTimestamp_prev.UnixMilli()))
+					webrtcStats.CurrentMessageArrivalTime.WithLabelValues("CurrentMessageArrivalTime").Set(float64(sfuTimestamp_now.UnixMilli()))
+					webrtcStats.MessageSentTime.WithLabelValues("MessageSentTime").Set(float64(frameData.MessageSentTimeSfu2))
+					webrtcStats.Jitter.WithLabelValues("Jitter").Set(jitter)
+					lastMessageTime.Store(sfuTimestamp_now)
+					//  update frameData.MessageSetime
+					frameData.MessageSentTimeSfu1 = sfuTimestamp
+					frameData.JitterSFU1 = int64(jitter)
+
+					// Append sfu1 timestamp (8 bytes) to the original payload
+					extendedPayload := make([]byte, len(msg.Data)+8)
+					copy(extendedPayload, msg.Data)
+
+					// Encode sfu1 timestamp as int64 in BigEndian
+					binary.BigEndian.PutUint64(extendedPayload[len(msg.Data):], uint64(sfuTimestamp))
+
+					// Log for verification
+					fmt.Printf("Forwarding message with frameId: %d, client1Timestamp: %d, sfuTimestamp: %d\n",
+						binary.BigEndian.Uint32(msg.Data[0:4]),
+						binary.BigEndian.Uint64(msg.Data[4:12]),
+						binary.BigEndian.Uint64(msg.Data[12:]),
+					)
+					marshaled, err := json.Marshal(frameData)
+					if err != nil {
+						fmt.Println("Error marshalling:", err)
+						return
+					}
+					messageChannel <- marshaled // Forward to sfu2
+
+					// messageChannel <- extendedPayload // Forward to sfu2
+				} else {
+					// If not in testing mode, just forward the message as is
+					control_signal_channel <- msg.Data
 				}
-				sfuTimestamp_now := time.Now()
-				sfuTimestamp := sfuTimestamp_now.UnixMilli()
-				sfuTimestamp_prev := lastMessageTime.Load().(time.Time)
-				delta := sfuTimestamp_now.Sub(sfuTimestamp_prev).Milliseconds()
-				jitter := updated_jitter.Load().(float64)
-				deltaAbs := math.Abs(float64(delta) - float64(frameData.MessageSendRate))
-				jitter = jitter + ((1.0 / 16.0) * (deltaAbs - jitter))
-				updated_jitter.Store(jitter)
-				webrtcStats.InterArrivalTime.WithLabelValues("InterArrivalTime").Set(float64(delta))
-				webrtcStats.PreviousMessageArrivalTime.WithLabelValues("PreviousMessageArrivalTime").Set(float64(sfuTimestamp_prev.UnixMilli()))
-				webrtcStats.CurrentMessageArrivalTime.WithLabelValues("CurrentMessageArrivalTime").Set(float64(sfuTimestamp_now.UnixMilli()))
-				webrtcStats.MessageSentTime.WithLabelValues("MessageSentTime").Set(float64(frameData.MessageSentTimeSfu2))
-				webrtcStats.Jitter.WithLabelValues("Jitter").Set(jitter)
-				lastMessageTime.Store(sfuTimestamp_now)
-				//  update frameData.MessageSetime
-				frameData.MessageSentTimeSfu1 = sfuTimestamp
-				frameData.JitterSFU1 = int64(jitter)
-
-				// Append sfu1 timestamp (8 bytes) to the original payload
-				extendedPayload := make([]byte, len(msg.Data)+8)
-				copy(extendedPayload, msg.Data)
-
-				// Encode sfu1 timestamp as int64 in BigEndian
-				binary.BigEndian.PutUint64(extendedPayload[len(msg.Data):], uint64(sfuTimestamp))
-
-				// Log for verification
-				fmt.Printf("Forwarding message with frameId: %d, client1Timestamp: %d, sfuTimestamp: %d\n",
-					binary.BigEndian.Uint32(msg.Data[0:4]),
-					binary.BigEndian.Uint64(msg.Data[4:12]),
-					binary.BigEndian.Uint64(msg.Data[12:]),
-				)
-				marshaled, err := json.Marshal(frameData)
-				if err != nil {
-					fmt.Println("Error marshalling:", err)
-					return
-				}
-				messageChannel <- marshaled // Forward to sfu2
-
-				// messageChannel <- extendedPayload // Forward to sfu2
 			})
 
 			peerConnection.OnICECandidate(func(candidate *webrtc.ICECandidate) {
